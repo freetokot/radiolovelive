@@ -1,0 +1,489 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Intelligent Web Streamer</title>
+    <style>
+        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; background: #f4f7f9; color: #333; padding: 1em; max-width: 600px; margin: auto; }
+        h1 { color: #1a237e; }
+        .player-container { background: #fff; border-radius: 8px; padding: 20px; box-shadow: 0 4px 12px rgba(0,0,0,0.08); }
+        
+        /* MODIFIED: Hide the default audio player UI */
+        #audioPlayer { display: none; }
+
+        .controls, .settings { margin-bottom: 1.5em; display: flex; align-items: center; gap: 15px; }
+        button { font-size: 1.1em; padding: 0.6em 1.2em; border-radius: 5px; border: none; cursor: pointer; background: #3949ab; color: white; transition: background-color 0.2s; }
+        button:disabled { background: #9fa8da; cursor: not-allowed; }
+        #status { border: 1px solid #e0e0e0; background: #fafafa; padding: 1em; white-space: pre-wrap; font-family: monospace; font-size: 0.9em; border-radius: 4px; min-height: 4em; }
+        #bufferMeterContainer { width: 100%; height: 10px; background: #e0e0e0; border-radius: 5px; margin: 0.5em 0; overflow: hidden; }
+        #bufferMeter { height: 100%; background: #42a5f5; width: 0%; transition: width 0.3s, background-color 0.3s; }
+        #bufferLabel { font-size: 0.9em; color: #555; }
+        input[type="range"] { flex-grow: 1; }
+
+        /* --- NEW STYLES --- */
+        .hidden {
+            display: none !important;
+        }
+        .volume-control {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            margin-bottom: 1.5em;
+        }
+        .volume-control span {
+            font-size: 1.5em;
+            -webkit-user-select: none;
+            user-select: none;
+        }
+        /* --- END NEW STYLES --- */
+    </style>
+</head>
+<body>
+
+    <div class="player-container">
+        <h1>Radio Love Live</h1>
+        
+        <div id="bufferSettings" class="settings">
+            <label for="bufferSlider">Target Buffer:</label>
+            <input type="range" id="bufferSlider" min="10" max="300" value="30" step="10">
+            <span id="bufferSliderValue">30s</span>
+        </div>
+
+        <!-- MODIFIED: Removed 'controls' attribute -->
+        <audio id="audioPlayer"></audio>
+        
+        <div id="bufferMeterContainer">
+            <div id="bufferMeter"></div>
+        </div>
+        <div id="bufferLabel">Buffer: 0.00s</div>
+
+        <div class="volume-control">
+            <span>🔊</span>
+            <input type="range" id="volumeSlider" min="0" max="100" value="100" title="Volume">
+        </div>
+
+        <div class="controls">
+            <button id="playBtn">Play</button>
+        </div>
+        
+        <div id="status"><strong>Status:</strong> Idle</div>
+    </div>
+
+    <script>
+    // --- CONFIGURATION ---
+    const SERVER_URL = 'http://45.61.158.129:8000' //'http://127.0.0.1:8000';
+    const INITIAL_PLAY_THRESHOLD_SECONDS = 5;
+    
+    // --- DOM ELEMENTS ---
+    const ui = {
+        playBtn: document.getElementById('playBtn'),
+        audioPlayer: document.getElementById('audioPlayer'),
+        statusDiv: document.getElementById('status'),
+        bufferMeter: document.getElementById('bufferMeter'),
+        bufferLabel: document.getElementById('bufferLabel'),
+        bufferSlider: document.getElementById('bufferSlider'),
+        bufferSliderValue: document.getElementById('bufferSliderValue'),
+        bufferSettings: document.getElementById('bufferSettings'), // NEW
+        volumeSlider: document.getElementById('volumeSlider'),       // NEW
+    };
+
+    // --- PLAYER STATE MACHINE ---
+    const playerManager = {
+        state: 'IDLE', // IDLE, INITIALIZING, BUFFERING, PLAYING, FETCHING, ERROR, PAUSED
+        mediaSource: null,
+        sourceBuffer: null,
+        appendQueue: [],
+        targetBufferSeconds: 30,
+        lastSuccessfullyParsedChunkId: null,
+        nextChunkIdToFetch: null,
+        isFetching: false, // Lock to prevent concurrent fetches
+
+        /**
+         * Transitions the player to a new state and updates the UI.
+         * @param {string} newState The new state to transition to.
+         * @param {string} [message] An optional message to display.
+         */
+        setState(newState, message = '') {
+            this.state = newState;
+            console.log(`State changed to: ${newState} - ${message}`);
+            this.updateUI(message);
+        },
+
+        /**
+         * Central function to update all UI elements based on the current state.
+         * @param {string} [statusMessage] The message for the status box.
+         */
+        updateUI(statusMessage) {
+            // Update Status Box
+            if (statusMessage) {
+                ui.statusDiv.innerHTML = `<strong>Status:</strong> ${this.state}<br>${statusMessage}`;
+            } else {
+                ui.statusDiv.innerHTML = `<strong>Status:</strong> ${this.state}`;
+            }
+            
+            // MODIFIED: Logic to handle Play/Pause button text
+            if (this.state === 'PLAYING') {
+                ui.playBtn.textContent = 'Pause';
+            } else {
+                ui.playBtn.textContent = 'Play';
+            }
+
+            // This line correctly enables the button for the right states
+            const isIdleOrError = ['IDLE', 'ERROR'].includes(this.state);
+            ui.playBtn.disabled = !isIdleOrError && !['PLAYING', 'PAUSED'].includes(this.state);
+            
+            // This line correctly hides/shows the buffer settings
+            ui.bufferSettings.classList.toggle('hidden', !isIdleOrError);
+        },
+
+        /**
+         * Main entry point to start the player.
+         */
+        async start() {
+            if (this.state !== 'IDLE' && this.state !== 'ERROR') return;
+            this.cleanup(); // Ensure a clean start
+            ui.audioPlayer.volume = ui.volumeSlider.value / 100;
+            this.setState('INITIALIZING', 'Setting up MediaSource...');
+            try {
+                if (!window.MediaSource) throw new Error('MediaSource API not supported.');
+                this.mediaSource = new MediaSource();
+                ui.audioPlayer.src = URL.createObjectURL(this.mediaSource);
+                this.mediaSource.addEventListener('sourceopen', this.onSourceOpen.bind(this));
+                this.mediaSource.addEventListener('sourceclose', this.cleanup.bind(this));
+            } catch (error) {
+                this.setState('ERROR', `Initialization failed: ${error.message}`);
+            }
+        },
+
+        /**
+         * Stops playback and resets the player to its initial state.
+         */
+        stop() {
+            this.setState('IDLE', 'Player stopped by user.');
+            if (this.mediaSource && this.mediaSource.readyState === 'open') {
+                this.mediaSource.endOfStream();
+            }
+            this.cleanup();
+        },
+
+        /**
+         * Cleans up all resources.
+         */
+        cleanup() {
+            console.log("Cleaning up resources.");
+            if (ui.audioPlayer.src) {
+                URL.revokeObjectURL(ui.audioPlayer.src);
+                ui.audioPlayer.src = '';
+                ui.audioPlayer.removeAttribute('src');
+                ui.audioPlayer.load();
+            }
+            this.mediaSource = null;
+            this.sourceBuffer = null;
+            this.appendQueue = [];
+            this.nextChunkIdToFetch = null;
+            this.isFetching = false;
+            this.setState('IDLE');
+        },
+
+        /**
+         * Called when the MediaSource is ready.
+         */
+        async onSourceOpen() {
+            this.setState('BUFFERING', 'MediaSource opened. Creating source buffer...');
+            try {
+                const mimeType = 'audio/mpeg';
+                if (!MediaSource.isTypeSupported(mimeType)) {
+                    throw new Error(`MIME type ${mimeType} not supported`);
+                }
+                this.sourceBuffer = this.mediaSource.addSourceBuffer(mimeType);
+                this.sourceBuffer.addEventListener('updateend', this.onBufferUpdateEnd.bind(this));
+                
+                // Get server info to determine where to start fetching.
+                const info = await this.getServerBufferInfo();
+                
+                // Start fetching slightly behind the live edge to ensure a good buffer.
+                this.nextChunkIdToFetch = info.latest_chunk_id - this.targetBufferSeconds * 4 - 20; 
+                this.setState('BUFFERING', `Initial pre-buffering from chunk ID ${this.nextChunkIdToFetch}...`);
+                
+                // Start the fetching and monitoring loop
+                this.monitorBuffer();
+
+            } catch (error) {
+                this.setState('ERROR', `Setup failed: ${error.message}`);
+            }
+        },
+
+        /**
+         * The heart of the player. Processes the append queue whenever the buffer is ready.
+         */
+        onBufferUpdateEnd() {
+            // If we have items in the queue and the buffer is not busy, append the next one.
+            if (this.appendQueue.length > 0 && !this.sourceBuffer.updating) {
+                try {
+                    const chunkData = this.appendQueue.shift();
+                    this.sourceBuffer.appendBuffer(chunkData);
+                } catch (error) {
+                    console.error("Error appending buffer:", error);
+                    // If append fails (e.g., quota exceeded), we might need to prune.
+                    this.pruneBuffer();
+                }
+            }
+            
+            // After an update, check if we need more data.
+            this.monitorBuffer();
+        },
+
+        /**
+         * Periodically checks buffer health and fetches more chunks if needed.
+         */
+        monitorBuffer() {
+            if (this.isFetching) {
+                return;
+            }
+            
+            if (!this.sourceBuffer || this.state === 'IDLE' || this.state === 'ERROR') {
+                return;
+            }
+
+            const buffered = this.sourceBuffer.buffered;
+            const currentTime = ui.audioPlayer.currentTime;
+            
+            // Calculate how much buffer is ahead of the current playhead
+            let bufferAhead = 0;
+            if (buffered.length > 0) {
+                bufferAhead = buffered.end(buffered.length - 1) - currentTime;
+            }
+            
+            this.updateBufferMeter(bufferAhead);
+
+            // Prune old data if the buffer is too large
+            this.pruneBuffer();
+
+            // Logic for starting playback and fetching more data
+            const isBufferLow = bufferAhead < (this.targetBufferSeconds - 3);
+            
+            if (this.state === 'BUFFERING' && bufferAhead >= INITIAL_PLAY_THRESHOLD_SECONDS) {
+                this.setState('PLAYING', 'Initial Buffer filled. Starting playback.');
+                ui.audioPlayer.play();
+            } else if (isBufferLow && !this.isFetching) {
+                console.log(`Buffer is low (${bufferAhead.toFixed(2)}s). Fetching more data...`);
+                this.fetchChunks();
+            }
+        },
+
+        /**
+         * Removes old audio data from the start of the buffer to manage memory.
+         */
+        pruneBuffer() {
+            if (!this.sourceBuffer || this.sourceBuffer.updating || this.sourceBuffer.buffered.length === 0) {
+                return;
+            }
+            
+            // This is the correct way to get the total DURATION of the buffered content.
+            const startOfBuffer = this.sourceBuffer.buffered.start(0);
+            const endOfBuffer = this.sourceBuffer.buffered.end(0); // Correctly defined here.
+            const bufferedDuration = this.sourceBuffer.buffered.end(0) - this.sourceBuffer.buffered.start(0);
+
+            // Set a maximum buffer duration slightly larger than the target.
+            // This is the total length we don't want to exceed.
+            const maxBufferDuration = this.targetBufferSeconds + 20; // e.g., 50s
+
+            if (bufferedDuration > maxBufferDuration) {
+                // --- THE CRITICAL FIX IS HERE ---
+
+                // Calculate the timestamp up to which we want to remove data.
+                // We want to keep `targetBufferSeconds` worth of audio.
+                // So, we calculate a point that is `targetBufferSeconds` seconds behind the very end of the buffer.
+                const removalPoint = endOfBuffer - this.targetBufferSeconds;
+
+                // This is the crucial safety check. We must ensure two things:
+                // 1. The removalPoint is actually ahead of the start of our buffer (to prevent no-op or invalid removals).
+                // 2. The current playback time (`currentTime`) is safely past the point we intend to remove.
+                // This prevents deleting the audio that is currently playing.
+                if (removalPoint > startOfBuffer && ui.audioPlayer.currentTime > removalPoint) {
+                    try {
+                        console.log(`Pruning buffer. Duration: ${bufferedDuration.toFixed(2)}s. Removing from ${startOfBuffer.toFixed(2)}s up to ${removalPoint.toFixed(2)}s.`);
+                        
+                        // THIS IS THE KEY: We remove from the `startOfBuffer`, not from 0.
+                        // This tells the browser it can completely forget the timeline before `startOfBuffer`.
+                        this.sourceBuffer.remove(startOfBuffer, removalPoint);
+
+                    } catch (error) {
+                        console.error(`Error during buffer removal: ${error.message}. This can happen if the timing is tight.`);
+                    }
+                }
+            }
+        },
+
+        /**
+         * Fetches a batch of chunks from the server.
+         */
+        async fetchChunks() {
+            if (this.isFetching) return;
+
+            this.isFetching = true;
+            
+            try {
+                if (this.nextChunkIdToFetch === null) {
+                    // This is your desired logic, now implemented correctly.
+                    // Do we have a history of a previously parsed chunk?
+                    if (this.lastSuccessfullyParsedChunkId !== null) {
+                        // Yes. Start fetching from the very next chunk to prevent gaps.
+                        this.nextChunkIdToFetch = Number(this.lastSuccessfullyParsedChunkId) + 1;
+                        console.log(`Resuming fetch from the chunk after the last parsed one: ${this.nextChunkIdToFetch}`);
+                        this.setState(this.state, 'Resuming fetch from last known position...');
+                    } else {
+                        // No history at all (first ever fetch). We must ask the server for a starting point.
+                        console.log("No last parsed chunk ID found. Re-syncing with server's live edge...");
+                        this.setState(this.state, 'Filling buffer from scrath...');
+                        const info = await this.getServerBufferInfo();
+                        // Start a few chunks behind the live edge to ensure a good pre-buffer
+                        this.nextChunkIdToFetch = info.latest_chunk_id - 4 * this.targetBufferSeconds; 
+                    }
+                }
+
+                // Now we are guaranteed to have a valid chunk ID to request.
+                this.setState(this.state, `Fetching from chunk ID ${this.nextChunkIdToFetch}...`);
+                
+                const response = await fetch(`${SERVER_URL}/fetch?start_id=${this.nextChunkIdToFetch}`);
+
+                if (!response.ok) {
+                    if (response.status === 410) { // Gone
+                        const info = await this.getServerBufferInfo();
+                        this.nextChunkIdToFetch = info.oldest_chunk_id + 20; // Jump to a safe point
+                        throw new Error(`Requested chunk too old. Jumping to ${this.nextChunkIdToFetch}.`);
+                    }
+                    throw new Error(`Server returned status ${response.status}`);
+                }
+
+                // IMPORTANT: Use the header to find the next chunk to fetch.
+                const nextId = response.headers.get('X-Next-Chunk-Id');
+                this.nextChunkIdToFetch = nextId ? parseInt(nextId, 10) : null;
+                console.log(`nextId: ${nextId}, stored nextChunkIdToFetch: ${this.nextChunkIdToFetch}`);
+                const binaryData = await response.arrayBuffer();
+                this.parseAndQueueChunks(binaryData);
+                
+                // If we've reached the live edge, wait before fetching again.
+                if (this.nextChunkIdToFetch === null) {
+                    console.log("Caught up to live edge. Will poll again shortly.");
+                    setTimeout(() => this.monitorBuffer(), 2000);
+                }
+
+            } catch (error) {
+                this.setState(this.state, `Fetch error: ${error.message}. Retrying...`);
+                // Simple retry mechanism
+                await new Promise(resolve => setTimeout(resolve, 2000));
+            } finally {
+                this.isFetching = false;
+                // Trigger a monitor check to see if another fetch is needed immediately
+                if (this.nextChunkIdToFetch !== null) {
+                    this.monitorBuffer();
+                }
+            }
+        },
+
+        /**
+         * Parses the binary response from the /fetch endpoint.
+         * @param {ArrayBuffer} arrayBuffer The binary data from the server.
+         */
+        parseAndQueueChunks(arrayBuffer) {
+            let offset = 0;
+            const dataView = new DataView(arrayBuffer);
+            
+            while (offset < arrayBuffer.byteLength) {
+                // Ensure there are at least 12 bytes for the headers
+                if (offset + 12 > arrayBuffer.byteLength) break;
+                
+                const chunkId = dataView.getBigUint64(offset, false); // Big-endian
+                offset += 8;
+                const chunkSize = dataView.getUint32(offset, false); // Big-endian
+                offset += 4;
+                //console.log(`Queued ${chunkId} chunk size: ${chunkSize}`);
+                if (offset + chunkSize > arrayBuffer.byteLength) {
+                    console.error("Incomplete chunk data received. Stopping parse.");
+                    break;
+                }
+
+                const chunkData = arrayBuffer.slice(offset, offset + chunkSize);
+                this.appendQueue.push(chunkData);
+                this.lastSuccessfullyParsedChunkId = chunkId;
+                offset += chunkSize;
+            }
+            console.log(`Queued ${this.appendQueue.length} chunks for appending.`);
+            
+            // Trigger the append process if it's not already running
+            this.onBufferUpdateEnd();
+        },
+
+        /**
+         * Fetches and parses the /buffer_info endpoint.
+         * @returns {Promise<object>}
+         */
+        async getServerBufferInfo() {
+            const response = await fetch(`${SERVER_URL}/buffer_info`);
+            if (!response.ok) throw new Error(`Failed to get buffer info: ${response.status}`);
+            const info = await response.json();
+            if (info.error) throw new Error(`Server buffer error: ${info.error}`);
+            return info;
+        },
+
+        /**
+         * Updates the visual buffer meter.
+         * @param {number} bufferSeconds The seconds of audio currently buffered.
+         */
+        updateBufferMeter(bufferSeconds) {
+            const percent = Math.min(bufferSeconds / this.targetBufferSeconds, 1) * 100;
+            ui.bufferMeter.style.width = percent + '%';
+            ui.bufferMeter.style.backgroundColor = percent < 30 ? '#ef5350' : (percent < 70 ? '#ffa726' : '#66bb6a');
+            ui.bufferLabel.textContent = `Buffer: ${bufferSeconds.toFixed(2)}s / ${this.targetBufferSeconds}s`;
+        },
+    };
+
+    // --- UI EVENT LISTENERS ---
+    ui.bufferSlider.addEventListener('input', (e) => {
+        playerManager.targetBufferSeconds = parseInt(e.target.value, 10);
+        ui.bufferSliderValue.textContent = `${playerManager.targetBufferSeconds}s`;
+    });
+
+     // MODIFIED: Replaced the old event listener with a proper Play/Pause toggle
+    ui.playBtn.addEventListener('click', () => {
+        const state = playerManager.state;
+
+        if (state === 'IDLE' || state === 'ERROR') {
+            // If the player is fully stopped, initialize and start it.
+            playerManager.start();
+        } else if (state === 'PLAYING') {
+            // If it's currently playing, pause it.
+            ui.audioPlayer.pause();
+        } else if (state === 'PAUSED') {
+            // If it's paused, resume playback.
+            ui.audioPlayer.play();
+        }
+        // The button is disabled in other states (like BUFFERING), so we don't need to handle them.
+    });
+
+    // NEW: Event listener for the volume slider
+    ui.volumeSlider.addEventListener('input', (e) => {
+        ui.audioPlayer.volume = e.target.value / 100;
+    });
+
+    ui.audioPlayer.addEventListener('play', () => {
+        if (playerManager.state === 'PAUSED') {
+            playerManager.setState('PLAYING');
+        }
+    });
+
+    ui.audioPlayer.addEventListener('pause', () => {
+        // Ignore the pause event that happens during cleanup
+        if (playerManager.state === 'PLAYING') {
+            playerManager.setState('PAUSED');
+        }
+    });
+
+    // Main monitoring loop driven by timeupdate
+    ui.audioPlayer.addEventListener('timeupdate', () => playerManager.monitorBuffer());
+
+    </script>
+</body>
+</html>
