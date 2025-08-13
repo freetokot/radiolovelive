@@ -72,7 +72,7 @@
 
     <script>
     // --- CONFIGURATION ---
-    const SERVER_URL = 'http://45.61.158.129:8000' //'http://127.0.0.1:8000';
+    const SERVER_URL = 'https://radiolovelive.onrender.com' //'http://45.61.158.129:8000' //'http://127.0.0.1:8000';
     const INITIAL_PLAY_THRESHOLD_SECONDS = 5;
     
     // --- DOM ELEMENTS ---
@@ -98,6 +98,8 @@
         lastSuccessfullyParsedChunkId: null,
         nextChunkIdToFetch: null,
         isFetching: false, // Lock to prevent concurrent fetches
+        consecutive404Count: 0, // Track consecutive 404 errors
+        pausedPollingTimer: null, // Timer for polling when paused
 
         /**
          * Transitions the player to a new state and updates the UI.
@@ -105,9 +107,28 @@
          * @param {string} [message] An optional message to display.
          */
         setState(newState, message = '') {
+            const oldState = this.state;
+
+            // If we are leaving the PAUSED state, clear the timer.
+            if (oldState === 'PAUSED' && newState !== 'PAUSED') {
+                if (this.pausedPollingTimer) {
+                    console.log("Leaving PAUSED state, clearing polling timer.");
+                    clearInterval(this.pausedPollingTimer);
+                    this.pausedPollingTimer = null;
+                }
+            }
+
             this.state = newState;
             console.log(`State changed to: ${newState} - ${message}`);
             this.updateUI(message);
+
+            // If we are entering the PAUSED state, start the timer.
+            if (newState === 'PAUSED' && oldState !== 'PAUSED') {
+                console.log("Entered PAUSED state, starting polling timer.");
+                // Immediately poll once, then set interval
+                this.pollServerForInfo();
+                this.pausedPollingTimer = setInterval(() => this.pollServerForInfo(), 60000); // 60 seconds
+            }
         },
 
         /**
@@ -183,6 +204,7 @@
             this.appendQueue = [];
             this.nextChunkIdToFetch = null;
             this.isFetching = false;
+            this.consecutive404Count = 0;
             this.setState('IDLE');
         },
 
@@ -261,7 +283,7 @@
             this.pruneBuffer();
 
             // Logic for starting playback and fetching more data
-            const isBufferLow = bufferAhead < (this.targetBufferSeconds - 3);
+            const isBufferLow = bufferAhead < (this.targetBufferSeconds );
             
             if (this.state === 'BUFFERING' && bufferAhead >= INITIAL_PLAY_THRESHOLD_SECONDS) {
                 this.setState('PLAYING', 'Initial Buffer filled. Starting playback.');
@@ -349,13 +371,51 @@
                 const response = await fetch(`${SERVER_URL}/fetch?start_id=${this.nextChunkIdToFetch}`);
 
                 if (!response.ok) {
+                    if (response.status === 404) {
+                        this.consecutive404Count++;
+                        console.log(`404 error #${this.consecutive404Count} for chunk ${this.nextChunkIdToFetch}`);
+                        
+                        // Check if we need to resync with server
+                        if (this.consecutive404Count > 3) {
+                            const buffered = this.sourceBuffer ? this.sourceBuffer.buffered : null;
+                            const currentTime = ui.audioPlayer.currentTime;
+                            let bufferAhead = 0;
+                            
+                            if (buffered && buffered.length > 0) {
+                                bufferAhead = buffered.end(buffered.length - 1) - currentTime;
+                            }
+                            
+                            // Check if buffer is less than half full
+                            if (bufferAhead < (this.targetBufferSeconds / 2)) {
+                                console.log(`Buffer is less than half full (${bufferAhead.toFixed(2)}s < ${(this.targetBufferSeconds / 2).toFixed(2)}s). Resyncing with server...`);
+                                this.setState(this.state, 'Too many 404s with low buffer. Resyncing with server...');
+                                
+                                const info = await this.getServerBufferInfo();
+                                this.nextChunkIdToFetch = info.latest_chunk_id - 4 * this.targetBufferSeconds;
+                                this.consecutive404Count = 0; // Reset counter after resync
+                                
+                                console.log(`Resynced: new fetch position is chunk ${this.nextChunkIdToFetch}`);
+                                this.setState(this.state, `Resynced to chunk ${this.nextChunkIdToFetch}. Continuing...`);
+                                
+                                // Continue with the new position immediately
+                                return this.fetchChunks();
+                            } else {
+                                console.log(`Buffer is more than half full (${bufferAhead.toFixed(2)}s >= ${(this.targetBufferSeconds / 2).toFixed(2)}s). Not resyncing yet.`);
+                            }
+                        }
+                        throw new Error(`404 Not Found for chunk ${this.nextChunkIdToFetch} (${this.consecutive404Count} consecutive)`);
+                    }
                     if (response.status === 410) { // Gone
                         const info = await this.getServerBufferInfo();
                         this.nextChunkIdToFetch = info.oldest_chunk_id + 20; // Jump to a safe point
+                        this.consecutive404Count = 0; // Reset 404 counter on successful recovery
                         throw new Error(`Requested chunk too old. Jumping to ${this.nextChunkIdToFetch}.`);
                     }
                     throw new Error(`Server returned status ${response.status}`);
                 }
+
+                // Reset 404 counter on successful response
+                this.consecutive404Count = 0;
 
                 // IMPORTANT: Use the header to find the next chunk to fetch.
                 const nextId = response.headers.get('X-Next-Chunk-Id');
@@ -437,6 +497,36 @@
             ui.bufferMeter.style.width = percent + '%';
             ui.bufferMeter.style.backgroundColor = percent < 30 ? '#ef5350' : (percent < 70 ? '#ffa726' : '#66bb6a');
             ui.bufferLabel.textContent = `Buffer: ${bufferSeconds.toFixed(2)}s / ${this.targetBufferSeconds}s`;
+        },
+
+        /**
+         * NEW: Polls the server for buffer info while paused to keep track of the live edge.
+         */
+        async pollServerForInfo() {
+            if (this.state !== 'PAUSED') return; // Safety check
+
+            console.log("Polling server for info while paused...");
+            try {
+                const info = await this.getServerBufferInfo();
+                
+                // Check if the chunk we expect to fetch next is still available on the server.
+                const isNextChunkAvailable = this.nextChunkIdToFetch >= info.oldest_chunk_id && this.nextChunkIdToFetch <= info.latest_chunk_id;
+
+                if (isNextChunkAvailable) {
+                    // The chunk is still there. No need to do anything.
+                    console.log(`Paused polling: Next chunk ${this.nextChunkIdToFetch} is still available on server. No changes needed.`);
+                    this.setState('PAUSED', `Awaiting resume. Next chunk ${this.nextChunkIdToFetch} is ready.`);
+                } else {
+                    // The chunk we wanted is gone (we were paused for too long).
+                    // We must re-sync to the live edge to be able to play again.
+                    console.warn(`Paused polling: Next chunk ${this.nextChunkIdToFetch} is no longer in server buffer. Re-syncing to live edge.`);
+                    this.nextChunkIdToFetch = info.latest_chunk_id - 20; // Start 20 chunks behind live edge
+                    this.setState('PAUSED', `Re-synced with server. Next chunk on resume: ${this.nextChunkIdToFetch}`);
+                }
+            } catch (error) {
+                console.error("Error polling server while paused:", error);
+                this.setState('PAUSED', `Failed to sync with server: ${error.message}`);
+            }
         },
     };
 
