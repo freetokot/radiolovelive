@@ -47,30 +47,46 @@ class StreamCacher(threading.Thread):
     def run(self):
         global chunk_id_counter
         global audio_buffer
-        pending_data = bytearray() # Промежуточный буфер
+        
+        # Промежуточный буфер для накопления ровных кусков
+        pending_data = bytearray()
 
         while True:
             try:
                 stream_url = self.stream_url_template.format(token=int(time.time()))
+                logging.info(f"Connecting to audio source: {stream_url}")
+                
                 with requests.get(stream_url, stream=True, timeout=10) as r:
-                    for raw_data in r.iter_content(chunk_size=1024): # Читаем мелко
-                        if not raw_data: continue
+                    r.raise_for_status()
+                    logging.info("Successfully connected to source. Caching stream...")
+                    
+                    # Обязательно считаем текущий размер ДО начала цикла
+                    with buffer_lock:
+                        total_bytes_in_buffer = sum(len(chunk) for _, chunk in audio_buffer)
+
+                    # Читаем мелкими кусками, чтобы не было задержек на сети
+                    for raw_data in r.iter_content(chunk_size=1024):
+                        if not raw_data:
+                            continue
+                            
+                        # Складываем в промежуточный буфер
                         pending_data.extend(raw_data)
 
-                        # Пока накопилось больше или равно CHUNK_SIZE_BYTES
+                        # Пока накопилось на полноценный ровный чанк (4096 байт)
                         while len(pending_data) >= CHUNK_SIZE_BYTES:
+                            # Отрезаем ровно 4096 байт
                             chunk_to_save = bytes(pending_data[:CHUNK_SIZE_BYTES])
                             del pending_data[:CHUNK_SIZE_BYTES]
 
                             with buffer_lock:
                                 audio_buffer.append((chunk_id_counter, chunk_to_save))
+                                total_bytes_in_buffer += len(chunk_to_save)
                                 chunk_id_counter += 1
 
-                            # Trim the buffer from the left if it exceeds the target size
-                            while total_bytes_in_buffer > BUFFER_SIZE_BYTES:
-                                _id, old_chunk = audio_buffer.popleft()
-                                total_bytes_in_buffer -= len(old_chunk)
-                                logging.debug(f"Removed old chunk ID {_id} to maintain buffer size.")
+                                # Удаляем старые чанки, если превышен лимит буфера
+                                while total_bytes_in_buffer > BUFFER_SIZE_BYTES:
+                                    _id, old_chunk = audio_buffer.popleft()
+                                    total_bytes_in_buffer -= len(old_chunk)
 
             except Exception as e:
                 logging.error(f"StreamCacher error: {e}. Reconnecting in 5 seconds.")
