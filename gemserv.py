@@ -47,29 +47,24 @@ class StreamCacher(threading.Thread):
     def run(self):
         global chunk_id_counter
         global audio_buffer
+        pending_data = bytearray() # Промежуточный буфер
 
         while True:
             try:
-                # Use a random token for each connection attempt as required by the source
                 stream_url = self.stream_url_template.format(token=int(time.time()))
-                logging.info(f"Connecting to audio source: {stream_url}")
-                
                 with requests.get(stream_url, stream=True, timeout=10) as r:
-                    r.raise_for_status()
-                    logging.info("Successfully connected to source. Caching stream...")
-                    
-                    total_bytes_in_buffer = sum(len(chunk) for _, chunk in audio_buffer)
+                    for raw_data in r.iter_content(chunk_size=1024): # Читаем мелко
+                        if not raw_data: continue
+                        pending_data.extend(raw_data)
 
-                    for chunk in r.iter_content(chunk_size=CHUNK_SIZE_BYTES):
-                        if not chunk:
-                            continue
+                        # Пока накопилось больше или равно CHUNK_SIZE_BYTES
+                        while len(pending_data) >= CHUNK_SIZE_BYTES:
+                            chunk_to_save = bytes(pending_data[:CHUNK_SIZE_BYTES])
+                            del pending_data[:CHUNK_SIZE_BYTES]
 
-                        with buffer_lock:
-                            # Append new chunk with a unique ID
-                            audio_buffer.append((chunk_id_counter, chunk))
-                            total_bytes_in_buffer += len(chunk)
-                            logging.debug(f"Cached chunk ID {chunk_id_counter}, size {len(chunk)} bytes.")
-                            chunk_id_counter += 1
+                            with buffer_lock:
+                                audio_buffer.append((chunk_id_counter, chunk_to_save))
+                                chunk_id_counter += 1
 
                             # Trim the buffer from the left if it exceeds the target size
                             while total_bytes_in_buffer > BUFFER_SIZE_BYTES:
