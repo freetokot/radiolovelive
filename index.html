@@ -100,6 +100,7 @@
         isFetching: false, // Lock to prevent concurrent fetches
         consecutive404Count: 0, // Track consecutive 404 errors
         pausedPollingTimer: null, // Timer for polling when paused
+        requiresReboot: false,
 
         /**
          * Transitions the player to a new state and updates the UI.
@@ -205,6 +206,7 @@
             this.nextChunkIdToFetch = null;
             this.isFetching = false;
             this.consecutive404Count = 0;
+            this.requiresReboot = false; // <-- СБРОС ФЛАГА
             this.setState('IDLE');
         },
 
@@ -503,29 +505,36 @@
          * NEW: Polls the server for buffer info while paused to keep track of the live edge.
          */
         async pollServerForInfo() {
-            if (this.state !== 'PAUSED') return; // Safety check
+            if (this.state !== 'PAUSED') return;
 
             console.log("Polling server for info while paused...");
             try {
                 const info = await this.getServerBufferInfo();
                 
-                // Check if the chunk we expect to fetch next is still available on the server.
+                // КРИТИЧЕСКИЙ ФИКС 1: Если за время await пользователь успел 
+                // нажать Play, состояние уже изменилось. Прерываем функцию!
+                if (this.state !== 'PAUSED') {
+                    console.log("State changed while polling. Aborting poll result.");
+                    return; 
+                }
+                
                 const isNextChunkAvailable = this.nextChunkIdToFetch >= info.oldest_chunk_id && this.nextChunkIdToFetch <= info.latest_chunk_id;
 
                 if (isNextChunkAvailable) {
-                    // The chunk is still there. No need to do anything.
-                    console.log(`Paused polling: Next chunk ${this.nextChunkIdToFetch} is still available on server. No changes needed.`);
+                    console.log(`Paused polling: Next chunk ${this.nextChunkIdToFetch} is still available.`);
                     this.setState('PAUSED', `Awaiting resume. Next chunk ${this.nextChunkIdToFetch} is ready.`);
                 } else {
-                    // The chunk we wanted is gone (we were paused for too long).
-                    // We must re-sync to the live edge to be able to play again.
-                    console.warn(`Paused polling: Next chunk ${this.nextChunkIdToFetch} is no longer in server buffer. Re-syncing to live edge.`);
-                    this.nextChunkIdToFetch = info.latest_chunk_id - 20; // Start 20 chunks behind live edge
-                    this.setState('PAUSED', `Re-synced with server. Next chunk on resume: ${this.nextChunkIdToFetch}`);
+                    // КРИТИЧЕСКИЙ ФИКС 2: Чанк протух. Старый буфер больше не валиден.
+                    // Не пытаемся склеить несклеиваемое, просто помечаем плеер для перезагрузки.
+                    console.warn(`Paused polling: Chunk expired. Marking for reboot on resume.`);
+                    this.requiresReboot = true;
+                    this.setState('PAUSED', `Session expired due to long pause. Will resync on resume.`);
                 }
             } catch (error) {
                 console.error("Error polling server while paused:", error);
-                this.setState('PAUSED', `Failed to sync with server: ${error.message}`);
+                if (this.state === 'PAUSED') {
+                    this.setState('PAUSED', `Failed to sync with server: ${error.message}`);
+                }
             }
         },
     };
@@ -559,15 +568,27 @@
     });
 
     ui.audioPlayer.addEventListener('play', () => {
+        // Если пауза была долгой, старый буфер недействителен.
+        if (playerManager.requiresReboot) {
+            console.log("Rebooting player due to long pause/stale buffer...");
+            ui.audioPlayer.pause(); // Глушим старый звук
+            playerManager.start();  // Запускаем чистую инициализацию с Live Edge
+            return;
+        }
+
         if (playerManager.state === 'PAUSED') {
             playerManager.setState('PLAYING');
         }
     });
 
     ui.audioPlayer.addEventListener('pause', () => {
-        // Ignore the pause event that happens during cleanup
-        if (playerManager.state === 'PLAYING') {
-            playerManager.setState('PAUSED');
+        // Перехватываем системную паузу (звонок/гарнитура), даже если
+        // плеер был в статусе BUFFERING или FETCHING
+        const state = playerManager.state;
+        if (state !== 'IDLE' && state !== 'INITIALIZING' && state !== 'ERROR') {
+            if (state !== 'PAUSED') {
+                playerManager.setState('PAUSED', 'Paused by system/user.');
+            }
         }
     });
 
