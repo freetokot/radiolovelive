@@ -572,6 +572,7 @@
         if (playerManager.requiresReboot) {
             console.log("Rebooting player due to long pause/stale buffer...");
             ui.audioPlayer.pause(); // Глушим старый звук
+            playerManager.stop();
             playerManager.start();  // Запускаем чистую инициализацию с Live Edge
             return;
         }
