@@ -100,7 +100,6 @@
         isFetching: false, // Lock to prevent concurrent fetches
         consecutive404Count: 0, // Track consecutive 404 errors
         pausedPollingTimer: null, // Timer for polling when paused
-        requiresReboot: false,
 
         /**
          * Transitions the player to a new state and updates the UI.
@@ -159,13 +158,14 @@
             ui.bufferSettings.classList.toggle('hidden', !isIdleOrError);
         },
 
-        /**
-         * Main entry point to start the player.
-         */
         async start() {
             if (this.state !== 'IDLE' && this.state !== 'ERROR') return;
-            this.cleanup(); // Ensure a clean start
+            
+            // ВАЖНО: Перед каждым запуском жестко синхронизируем настройки с интерфейсом!
+            this.targetBufferSeconds = parseInt(ui.bufferSlider.value, 10);
             ui.audioPlayer.volume = ui.volumeSlider.value / 100;
+            
+            this.cleanup(); // Очищаем возможные остатки
             this.setState('INITIALIZING', 'Setting up MediaSource...');
             try {
                 if (!window.MediaSource) throw new Error('MediaSource API not supported.');
@@ -181,35 +181,46 @@
         /**
          * Stops playback and resets the player to its initial state.
          */
-        stop() {
-            this.setState('IDLE', 'Player stopped by user.');
+        stop(message = 'Player stopped by user.') {
             if (this.mediaSource && this.mediaSource.readyState === 'open') {
-                this.mediaSource.endOfStream();
+                try { this.mediaSource.endOfStream(); } catch(e) { console.error("Error ending stream:", e); }
             }
-            this.cleanup();
+            this.cleanup(message);
         },
 
         /**
          * Cleans up all resources.
          */
-        cleanup() {
+        cleanup(message = '') {
             console.log("Cleaning up resources.");
+            
+            // 1. Сначала меняем стейт на IDLE, чтобы заблокировать все фоновые процессы
+            this.setState('IDLE', message);
+
+            // 2. Уничтожаем аудио-источник
             if (ui.audioPlayer.src) {
                 URL.revokeObjectURL(ui.audioPlayer.src);
                 ui.audioPlayer.src = '';
                 ui.audioPlayer.removeAttribute('src');
-                ui.audioPlayer.load();
+                try { ui.audioPlayer.load(); } catch (e) {}
             }
+            
+            // 3. Обнуляем переменные (используем Array() для обхода бага)
             this.mediaSource = null;
             this.sourceBuffer = null;
-            this.appendQueue = [];
+            this.appendQueue = new Array(); // Избегаем конструкции "=[];"
             this.nextChunkIdToFetch = null;
+            this.lastSuccessfullyParsedChunkId = null;
             this.isFetching = false;
             this.consecutive404Count = 0;
-            this.requiresReboot = false; // <-- СБРОС ФЛАГА
-            this.setState('IDLE');
+            
+            // 4. Очищаем таймер поллинга
+            if (this.pausedPollingTimer) {
+                clearInterval(this.pausedPollingTimer);
+                this.pausedPollingTimer = null;
+            }
         },
-
+        
         /**
          * Called when the MediaSource is ready.
          */
@@ -510,25 +521,30 @@
             console.log("Polling server for info while paused...");
             try {
                 const info = await this.getServerBufferInfo();
+                if (this.state !== 'PAUSED') return; // Защита от гонки состояний
                 
-                // КРИТИЧЕСКИЙ ФИКС 1: Если за время await пользователь успел 
-                // нажать Play, состояние уже изменилось. Прерываем функцию!
-                if (this.state !== 'PAUSED') {
-                    console.log("State changed while polling. Aborting poll result.");
-                    return; 
+                // Вычисляем ID чанка, который нам действительно нужен следующим
+                let expectedNextChunkId = this.nextChunkIdToFetch;
+                
+                // Если nextChunkIdToFetch пуст, берем следующий после последнего успешно скачанного
+                if (expectedNextChunkId === null && this.lastSuccessfullyParsedChunkId !== null) {
+                    expectedNextChunkId = Number(this.lastSuccessfullyParsedChunkId) + 1;
                 }
-                
-                const isNextChunkAvailable = this.nextChunkIdToFetch >= info.oldest_chunk_id && this.nextChunkIdToFetch <= info.latest_chunk_id;
+
+                let isNextChunkAvailable = true; // По умолчанию считаем, что всё ок (если плеер еще чист)
+
+                if (expectedNextChunkId !== null) {
+                    // Чанк протух ТОЛЬКО если он стал меньше самого старого чанка на сервере.
+                    // (Если он больше latest_chunk_id, значит мы на live-edge и просто ждем его генерации)
+                    isNextChunkAvailable = expectedNextChunkId >= info.oldest_chunk_id;
+                }
 
                 if (isNextChunkAvailable) {
-                    console.log(`Paused polling: Next chunk ${this.nextChunkIdToFetch} is still available.`);
-                    this.setState('PAUSED', `Awaiting resume. Next chunk ${this.nextChunkIdToFetch} is ready.`);
+                    console.log(`Paused polling: Session is valid. Expected next chunk: ${expectedNextChunkId}. Awaiting resume.`);
+                    this.setState('PAUSED', `Awaiting resume on chunk: ${expectedNextChunkId}.`);
                 } else {
-                    // КРИТИЧЕСКИЙ ФИКС 2: Чанк протух. Старый буфер больше не валиден.
-                    // Не пытаемся склеить несклеиваемое, просто помечаем плеер для перезагрузки.
-                    console.warn(`Paused polling: Chunk expired. Marking for reboot on resume.`);
-                    this.requiresReboot = true;
-                    this.setState('PAUSED', `Session expired due to long pause. Will resync on resume.`);
+                    console.warn(`Paused polling: Chunk ${expectedNextChunkId} expired (oldest on server is ${info.oldest_chunk_id}). Force stopping player.`);
+                    this.stop('Session expired due to long pause. Press Play to reconnect.');
                 }
             } catch (error) {
                 console.error("Error polling server while paused:", error);
@@ -568,15 +584,6 @@
     });
 
     ui.audioPlayer.addEventListener('play', () => {
-        // Если пауза была долгой, старый буфер недействителен.
-        if (playerManager.requiresReboot) {
-            console.log("Rebooting player due to long pause/stale buffer...");
-            ui.audioPlayer.pause(); // Глушим старый звук
-            playerManager.stop();
-            playerManager.start();  // Запускаем чистую инициализацию с Live Edge
-            return;
-        }
-
         if (playerManager.state === 'PAUSED') {
             playerManager.setState('PLAYING');
         }
